@@ -111,6 +111,16 @@ public class SkipBlockRangeIterator extends AbstractDocIdSetIterator {
     return DocIdSetIterator.NO_MORE_DOCS;
   }
 
+  /**
+   * Returns the exclusive end of the current skip block (the actual block boundary from the
+   * skipper), regardless of match state. Unlike {@link #docIDRunEnd()} which returns {@code doc+1}
+   * for MAYBE blocks, this always returns the full block boundary so callers can bulk-evaluate the
+   * entire block at once.
+   */
+  public int blockEnd() {
+    return skipper.maxDocID(0) + 1;
+  }
+
   @Override
   public int docIDRunEnd() throws IOException {
     if (match != Match.YES) {
@@ -120,7 +130,9 @@ public class SkipBlockRangeIterator extends AbstractDocIdSetIterator {
     int nextLevel = 1;
     while (nextLevel < skipper.numLevels()
         && skipper.minValue(nextLevel) >= minValue
-        && skipper.maxValue(nextLevel) <= maxValue) {
+        && skipper.maxValue(nextLevel) <= maxValue
+        && skipper.maxDocID(nextLevel) - skipper.minDocID(nextLevel)
+            == skipper.docCount(nextLevel) - 1) {
       maxDoc = skipper.maxDocID(nextLevel);
       nextLevel++;
     }
