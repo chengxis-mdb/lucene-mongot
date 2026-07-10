@@ -19,6 +19,7 @@ package org.apache.lucene.search;
 import java.io.IOException;
 import java.util.Arrays;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 
 /**
  * A constant-scoring {@link Scorer}.
@@ -53,6 +54,27 @@ public final class ConstantScoreScorer extends Scorer {
     @Override
     public long cost() {
       return delegate.cost();
+    }
+
+    @Override
+    public void intoBitSet(int upTo, FixedBitSet bitSet, int offset) throws IOException {
+      if (doc != delegate.docID()) {
+        // The delegate was swapped for an empty iterator (see setMinCompetitiveScore); the
+        // default implementation terminates via nextDoc() without touching the stale delegate
+        // position.
+        super.intoBitSet(upTo, bitSet, offset);
+        return;
+      }
+      delegate.intoBitSet(upTo, bitSet, offset);
+      doc = delegate.docID();
+    }
+
+    @Override
+    public int docIDRunEnd() throws IOException {
+      if (doc != delegate.docID()) {
+        return super.docIDRunEnd();
+      }
+      return delegate.docIDRunEnd();
     }
   }
 
@@ -147,18 +169,68 @@ public final class ConstantScoreScorer extends Scorer {
     return score;
   }
 
+  // Doc-ID window covered by one bulk #nextDocsAndScores fill. Matches
+  // MaxScoreBulkScorer.INNER_WINDOW_SIZE and DenseConjunctionBulkScorer.WINDOW_SIZE, so a single
+  // fill covers a full inner scoring window with a bit set that stays core-cache resident.
+  private static final int BULK_WINDOW_SIZE = 4096;
+
+  private FixedBitSet bulkWindowMatches; // lazily allocated
+
   @Override
   public void nextDocsAndScores(int upTo, Bits liveDocs, DocAndFloatFeatureBuffer buffer)
       throws IOException {
-    int batchSize = 64;
-    buffer.growNoCopy(batchSize);
-    int size = 0;
-    DocIdSetIterator iterator = iterator();
-    for (int doc = iterator.docID(); doc < upTo && size < batchSize; doc = iterator.nextDoc()) {
-      if (liveDocs == null || liveDocs.get(doc)) {
-        buffer.docs[size] = doc;
-        ++size;
+    if (twoPhaseIterator != null) {
+      // Matches must be verified one by one, keep the doc-at-a-time loop.
+      int batchSize = 64;
+      buffer.growNoCopy(batchSize);
+      int size = 0;
+      DocIdSetIterator iterator = iterator();
+      for (int doc = iterator.docID(); doc < upTo && size < batchSize; doc = iterator.nextDoc()) {
+        if (liveDocs == null || liveDocs.get(doc)) {
+          buffer.docs[size] = doc;
+          ++size;
+        }
       }
+      Arrays.fill(buffer.features, 0, size, score);
+      buffer.size = size;
+      return;
+    }
+
+    // Drain a window of matches in bulk via DocIdSetIterator#intoBitSet. Composite iterators
+    // such as postings disjunctions implement it with one bulk load per sub-iterator, which is
+    // much cheaper than paying a priority-queue update per nextDoc() call. This matters for
+    // constant-score clauses under top-k disjunctions (MaxScoreBulkScorer), which have no
+    // impact-based bulk path.
+    buffer.size = 0;
+    DocIdSetIterator iterator = iterator();
+    int doc = iterator.docID();
+    if (doc >= upTo) {
+      return;
+    }
+    if (bulkWindowMatches == null) {
+      bulkWindowMatches = new FixedBitSet(BULK_WINDOW_SIZE);
+    } else {
+      bulkWindowMatches.clear();
+    }
+    int windowMax = (int) Math.min(upTo, (long) doc + BULK_WINDOW_SIZE);
+    iterator.intoBitSet(windowMax, bulkWindowMatches, doc);
+    int cardinality = bulkWindowMatches.cardinality();
+    if (cardinality == 0) {
+      // No match in this window; the iterator already advanced to windowMax or beyond, the
+      // caller re-invokes for the next window.
+      return;
+    }
+    buffer.growNoCopy(cardinality);
+    int size = bulkWindowMatches.intoArray(0, windowMax - doc, doc, buffer.docs);
+    if (liveDocs != null) {
+      int kept = 0;
+      for (int i = 0; i < size; ++i) {
+        int d = buffer.docs[i];
+        if (liveDocs.get(d)) {
+          buffer.docs[kept++] = d;
+        }
+      }
+      size = kept;
     }
     Arrays.fill(buffer.features, 0, size, score);
     buffer.size = size;
