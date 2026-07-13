@@ -83,6 +83,10 @@ public final class ConstantScoreScorer extends Scorer {
   private final DocIdSetIterator approximation;
   private final TwoPhaseIterator twoPhaseIterator;
   private final DocIdSetIterator disi;
+  // Whether the underlying iterator pays per-nextDoc() overhead that the bulk
+  // #nextDocsAndScores path amortizes (see below). Cheap iterators (single postings, bit sets)
+  // are better served by the plain doc-at-a-time loop.
+  private final boolean bulkDrainWorthwhile;
 
   /**
    * Constructor based on a {@link DocIdSetIterator} which will be used to drive iteration. Two
@@ -101,6 +105,7 @@ public final class ConstantScoreScorer extends Scorer {
         scoreMode == ScoreMode.TOP_SCORES ? new DocIdSetIteratorWrapper(disi) : disi;
     this.twoPhaseIterator = null;
     this.disi = this.approximation;
+    this.bulkDrainWorthwhile = disi instanceof DisjunctionDISIApproximation;
   }
 
   /**
@@ -135,6 +140,7 @@ public final class ConstantScoreScorer extends Scorer {
       this.twoPhaseIterator = twoPhaseIterator;
     }
     this.disi = TwoPhaseIterator.asDocIdSetIterator(this.twoPhaseIterator);
+    this.bulkDrainWorthwhile = false; // two-phase matches must be verified one by one
   }
 
   @Override
@@ -179,8 +185,12 @@ public final class ConstantScoreScorer extends Scorer {
   @Override
   public void nextDocsAndScores(int upTo, Bits liveDocs, DocAndFloatFeatureBuffer buffer)
       throws IOException {
-    if (twoPhaseIterator != null) {
-      // Matches must be verified one by one, keep the doc-at-a-time loop.
+    if (bulkDrainWorthwhile == false) {
+      // Either matches must be verified one by one (two-phase), or the iterator is cheap to
+      // advance one doc at a time (single postings list, bit set) and the per-window fixed cost
+      // of the bulk path (bit set clear/flatten) would not pay for itself. Only heap-based
+      // composite iterators (disjunctions), which pay a priority-queue update per nextDoc(),
+      // benefit from the bulk drain.
       int batchSize = 64;
       buffer.growNoCopy(batchSize);
       int size = 0;
